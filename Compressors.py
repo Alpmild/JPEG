@@ -1,8 +1,6 @@
 import heapq
 
 class Huffman:
-    folder = "Files\\Results\\Huffman"
-
     class Node:
         def __init__(self, value=None, freq=0, left=None, right=None):
             self.value = value
@@ -12,11 +10,6 @@ class Huffman:
 
         def __lt__(self, other):
             return self.freq < other.freq
-
-    def __init__(self, reps_size=4):
-        self.count_size = 2
-        self.reps_size = reps_size
-        self.step = self.reps_size + 1
 
     @classmethod
     def build_tree(cls, freq_dict: dict):

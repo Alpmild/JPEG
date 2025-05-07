@@ -8,9 +8,11 @@ from Compressors import Huffman as Huf
 CAT_FORM = '>BI'
 RLE_CAT_FORM = '>IBI'
 SEQ_LEN_FORM = '>I'
-INFO_FORM = '>HHBB'
+INFO_FORM = '>HHBBB'
 N = 8
 f = 0
+
+modes = ['RGB', 'L', '1', 'RGBA']
 
 Y_QMATRIX = np.array([
     [16,  11,  10,  16,  24,  40,  51,  61],
@@ -33,10 +35,12 @@ CbCr_QMATRIX = np.array([
     [99,  99,  99,  99,  99,  99,  99,  99]
 ])
 
+
 def c_dct(u):
-    if u == 0:
-        return 2 ** -0.5
-    return 1
+    if isinstance(u, int):
+        return 2 ** -0.5 if u == 0 else 1.0
+    u = np.asarray(u)
+    return np.where(u == 0, 2 ** -0.5, 1.0)
 
 
 def category(delta):
@@ -64,8 +68,8 @@ def iconvert(bits, cat):
 
 
 def quant_matrix(qmatrix, quality):
-    if quality < 1:
-        quality = 1
+    if quality <= 0:
+        quality = 0.01
     elif quality > 100:
         quality = 100
 
@@ -79,61 +83,56 @@ def quant_matrix(qmatrix, quality):
     return scaled_matrix
 
 
-def decode(data: bytes, root: Huf.Node, padding: int, mode: str, blocks_cnt: int, n=N):
-    """Где-то здесь ебанная ошибка"""
+def decode(data: bytes, root: Huf.Node, padding: int, mode: str):
     assert mode == 'AC' or mode == 'DC'
 
-    decoded = []
-    bits_buffer = ""
-    cur_node = root
-    k = n ** 2 - 1
-
-    codes = Huf.build_code(root)
-
-    for b in data:
-        bits_buffer += bin(b)[2:].rjust(8, '0')
-    if 0 < padding:
+    bits_buffer = ''.join(f'{byte:08b}' for byte in data)
+    if padding > 0:
         bits_buffer = bits_buffer[:-padding]
 
-    while len(bits_buffer) >= 0:
+    decoded = []
+    cur_node = root
+    i = 0
+
+    while i < len(bits_buffer):
+        bit = bits_buffer[i]
+        i += 1
+        cur_node = cur_node.left if bit == '0' else cur_node.right
+
         if cur_node.value is not None:
             if mode == 'DC':
                 cat = cur_node.value
                 if cat != 0:
-                    dc = iconvert(bits_buffer[:cat], cat)
+                    dc = iconvert(bits_buffer[i:i + cat], cat)
                     decoded.append(dc)
                 else:
                     decoded.append(0)
+                i += cat
             else:
                 run_len, cat = cur_node.value
                 decoded.extend([0] * run_len)
                 if cat != 0:
-                    ac = iconvert(bits_buffer[:cat], cat)
+                    ac = iconvert(bits_buffer[i:i + cat], cat)
                     decoded.append(ac)
                 else:
                     break
+                i += cat
             cur_node = root
-            bits_buffer = bits_buffer[cat:]
-
-        if not bits_buffer:
-            break
-
-        bit = bits_buffer[0]
-        bits_buffer = bits_buffer[1:]
-        if bit == '0':
-            cur_node = cur_node.left
-        else:
-            cur_node = cur_node.right
 
     for i in range(1, len(decoded)):
-        decoded[i] += decoded[i -  1]
+        decoded[i] += decoded[i - 1]
 
     return np.array(decoded)
 
 
 class JPEGencoder:
     def __init__(self, path, scale):
-        self.image = np.array(Image.open(path))
+        image = Image.open(path)
+        self.mode = modes.index(image.mode)
+        if image.mode in ('L', '1'):
+            image = image.convert('RGB')
+        self.image = np.array(image)
+
         self.scale = scale
         self.y_qmatrix = quant_matrix(Y_QMATRIX, scale)
         self.cbcr_qmatrix = quant_matrix(CbCr_QMATRIX, scale)
@@ -180,20 +179,22 @@ class JPEGencoder:
         return blocks_array
 
     @staticmethod
-    def dct(matrix: np.array):
+    def dct(block: np.ndarray):
         def F(u, v):
-            n = matrix.shape[0]
-            res = 0.0
-            for x in range(n):
-                for y in range(n):
-                    cos1 = np.cos((2 * x + 1) * u * np.pi / (2 * n))
-                    cos2 = np.cos((2 * y + 1) * v * np.pi / (2 * n))
-                    res += matrix[x, y] * cos1 * cos2
+            n = block.shape[0]
+            x = np.arange(n)
+            y = np.arange(n)
 
-            res = res * c_dct(u) * c_dct(v) * 2 / n
+            cos1 = np.cos((2 * x[:, None] + 1) * u * np.pi / (2 * n))
+            cos2 = np.cos((2 * y[None, :] + 1) * v * np.pi / (2 * n))
+
+            cos_matrix = cos1 @ cos2
+            res = np.sum(block * cos_matrix)
+
+            res *= c_dct(u) * c_dct(v) * 2 / n
             return res
 
-        h, w = matrix.shape[:2]
+        h, w = block.shape[:2]
         if h != w:
             raise ValueError(f"Матрица должна быть квадратной: h={h}, w={w}")
         n_ = h
@@ -326,7 +327,7 @@ class JPEGencoder:
     def process(self, path, block_size=N):
         h, w = self.image.shape[:2]
         output_file = open(path, "wb")
-        output_file.write(struct.pack(INFO_FORM, h, w, block_size, self.scale))
+        output_file.write(struct.pack(INFO_FORM, h, w, self.mode, block_size, self.scale))
 
         image_ycbcr = self.to_ycbcr(self.image)
         for i in range(3):
@@ -396,24 +397,30 @@ class JPEGdecoder:
         return image[:h, :w]
 
     @staticmethod
-    def idct(matrix: np.array):
-        def f(x, y):
-            n = matrix.shape[0]
-            res = 0.0
-            for u in range(n):
-                for v in range(n):
-                    cos1 = np.cos((2 * x + 1) * u * np.pi / (2 * n))
-                    cos2 = np.cos((2 * y + 1) * v * np.pi / (2 * n))
-                    res += c_dct(u) * c_dct(v) * matrix[u, v] * cos1 * cos2
+    def idct(block: np.ndarray):
+        def F(x, y):
+            n = block.shape[0]
+            u = np.arange(n)
+            v = np.arange(n)
 
-            res = res * 2 / n
+            cos1 = np.cos((2 * x + 1) * u[:, None] * np.pi / (2 * n))
+            cos2 = np.cos((2 * y + 1) * v[:, None] * np.pi / (2 * n))
+
+            cos_matrix = cos1 @ cos2.T
+
+            c_u = c_dct(u).reshape(-1, 1)
+            c_v = c_dct(v).reshape(1, -1)
+            scale = c_u * c_v
+
+            res = np.sum(scale * block * cos_matrix)
+            res *= 2 / n
             return res
 
-        h, w = matrix.shape[:2]
+        h, w = block.shape[:2]
         if h != w:
             raise ValueError(f"Матрица должна быть квадратной: h={h}, w={w}")
         n_ = h
-        return np.array([[f(i, j) for j in range(n_)] for i in range(n_)])
+        return np.array([[F(i, j) for j in range(n_)] for i in range(n_)])
 
     @staticmethod
     def restore_block(block, qmatrix):
@@ -447,7 +454,7 @@ class JPEGdecoder:
         return np.array(matrix)
 
     @staticmethod
-    def decode(file, mode, blocks_cnt, block_size):
+    def decode(file, mode):
         assert mode == 'AC' or mode == 'DC'
 
         freg_dict_len = struct.unpack('>H', file.read(2))[0]
@@ -465,11 +472,12 @@ class JPEGdecoder:
         padding = struct.unpack('>B', file.read(1))[0]
 
         root = Huf.build_tree(freq_dict)
-        return decode(data, root=root, padding=padding, mode=mode, blocks_cnt=blocks_cnt, n=block_size)
+        return decode(data, root=root, padding=padding, mode=mode)
 
     def process(self, path):
         size = struct.calcsize(INFO_FORM)
-        h, w, block_size, scale = struct.unpack(INFO_FORM, self.image.read(size))
+        h, w, mode, block_size, scale = struct.unpack(INFO_FORM, self.image.read(size))
+        mode = modes[mode]
 
         k = block_size ** 2 - 1
         yb_cnt = int(np.ceil(h / block_size) * np.ceil(h / block_size))
@@ -486,11 +494,11 @@ class JPEGdecoder:
             else:
                 b = cbcrb_cnt
                 qmatrix = cbcr_qmatrix
-            dc = np.array(self.decode(self.image, 'DC', b, block_size))
+            dc = np.array(self.decode(self.image, 'DC'))
             print("DC", len(dc))
             dc.resize(b, 1)
 
-            ac = np.array(self.decode(self.image, 'AC', b, block_size))
+            ac = np.array(self.decode(self.image, 'AC'))
             print("AC", len(ac))
             ac.resize(b, k)
 
@@ -508,12 +516,7 @@ class JPEGdecoder:
 
         new_image = np.stack(channels, axis=-1).clip(0, 255).astype(np.uint8)
         new_image = Image.fromarray(self.from_ycbcr(new_image))
+        if mode != 'RGB':
+            new_image = new_image.convert(mode)
 
         new_image.save(path)
-
-
-jpeg = JPEGencoder("Images\\Lenna.png", 30)
-jpeg.process("Images\\test_jpeg")
-print()
-decoder = JPEGdecoder("Images\\test_jpeg")
-decoder.process('Images\\Lenna_restored.png')
